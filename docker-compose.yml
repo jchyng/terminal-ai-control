@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  terminal-ai:
+    build: .
+    container_name: terminal-ai-control
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      # Mount your project directories
+      - ~/projects:/home/projects:rw
+      # Mount config (create config.json first)
+      - ./config.json:/app/config.json:ro
+    environment:
+      - NODE_ENV=production
+      - SHELL=/bin/bash
+    # Optional: use host network for Tailscale
+    # network_mode: host

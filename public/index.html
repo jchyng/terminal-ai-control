@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Terminal AI Control</title>
+  
+  <!-- xterm.js - stable version -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+  
+  <!-- Socket.IO -->
+  <script src="/socket.io/socket.io.js"></script>
+  
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    :root {
+      --bg-primary: #0d1117;
+      --bg-secondary: #161b22;
+      --bg-tertiary: #21262d;
+      --border-color: #30363d;
+      --text-primary: #e6edf3;
+      --text-secondary: #8b949e;
+      --accent-color: #58a6ff;
+      --success-color: #3fb950;
+      --warning-color: #d29922;
+      --error-color: #f85149;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* Header */
+    .header {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      padding: 12px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .logo {
+      font-size: 20px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .logo-icon {
+      font-size: 24px;
+    }
+
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      background: var(--bg-tertiary);
+      border-radius: 20px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--error-color);
+    }
+
+    .status-dot.connected {
+      background: var(--success-color);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    .header-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .btn {
+      padding: 8px 16px;
+      border: 1px solid var(--border-color);
+      background: var(--bg-tertiary);
+      color: var(--text-primary);
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+
+    .btn:hover {
+      background: var(--border-color);
+    }
+
+    .btn-primary {
+      background: var(--accent-color);
+      border-color: var(--accent-color);
+      color: #fff;
+    }
+
+    .btn-primary:hover {
+      background: #4393e6;
+    }
+
+    /* Terminal Container */
+    .terminal-wrapper {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      padding: 16px;
+      overflow: hidden;
+    }
+
+    .terminal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-color);
+      border-bottom: none;
+      border-radius: 8px 8px 0 0;
+    }
+
+    .terminal-tabs {
+      display: flex;
+      gap: 8px;
+    }
+
+    .terminal-tab {
+      padding: 6px 12px;
+      background: var(--bg-tertiary);
+      border-radius: 4px;
+      font-size: 13px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .terminal-tab.active {
+      background: var(--accent-color);
+    }
+
+    .terminal-controls {
+      display: flex;
+      gap: 8px;
+    }
+
+    .terminal-control {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      cursor: pointer;
+    }
+
+    .control-close { background: #ff5f57; }
+    .control-minimize { background: #febc2e; }
+    .control-maximize { background: #28c840; }
+
+    #terminal-container {
+      flex: 1;
+      background: #000;
+      border: 1px solid var(--border-color);
+      border-radius: 0 0 8px 8px;
+      overflow: hidden;
+    }
+
+    /* Footer */
+    .footer {
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border-color);
+      padding: 8px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      color: var(--text-secondary);
+      flex-shrink: 0;
+    }
+
+    .footer-left {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .shortcut {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .key {
+      padding: 2px 6px;
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 11px;
+    }
+
+    /* Mobile adjustments */
+    @media (max-width: 768px) {
+      .header {
+        padding: 10px 12px;
+      }
+
+      .logo span {
+        display: none;
+      }
+
+      .terminal-wrapper {
+        padding: 8px;
+      }
+
+      .footer {
+        display: none;
+      }
+
+      .btn span {
+        display: none;
+      }
+    }
+
+    /* Toast notifications */
+    .toast-container {
+      position: fixed;
+      bottom: 80px;
+      right: 20px;
+      z-index: 1000;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .toast {
+      padding: 12px 20px;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      animation: slideIn 0.3s ease;
+      max-width: 300px;
+    }
+
+    .toast.success { border-left: 3px solid var(--success-color); }
+    .toast.error { border-left: 3px solid var(--error-color); }
+    .toast.info { border-left: 3px solid var(--accent-color); }
+
+    @keyframes slideIn {
+      from { transform: translateX(100%); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
+
+    /* Loading overlay */
+    .loading-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(13, 17, 23, 0.9);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 2000;
+    }
+
+    .loading-overlay.hidden {
+      display: none;
+    }
+
+    .spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid var(--border-color);
+      border-top-color: var(--accent-color);
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .loading-text {
+      margin-top: 16px;
+      color: var(--text-secondary);
+    }
+  </style>
+</head>
+<body>
+  <!-- Loading Overlay -->
+  <div class="loading-overlay" id="loading">
+    <div class="spinner"></div>
+    <div class="loading-text">터미널 연결 중...</div>
+  </div>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <div class="logo">
+        <span class="logo-icon">🖥️</span>
+        <span>Terminal AI Control</span>
+      </div>
+      <div class="status-badge">
+        <div class="status-dot" id="status-dot"></div>
+        <span id="status-text">연결 중...</span>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button class="btn" onclick="notifyOnComplete()" title="작업 완료 시 Discord 알림">
+        🔔 <span>알림</span>
+      </button>
+      <button class="btn" onclick="clearTerminal()" title="터미널 지우기">
+        🗑️ <span>지우기</span>
+      </button>
+      <button class="btn btn-primary" onclick="reconnect()" title="재연결">
+        🔄 <span>재연결</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Terminal -->
+  <div class="terminal-wrapper">
+    <div class="terminal-header">
+      <div class="terminal-tabs">
+        <div class="terminal-tab active">
+          <span>📟</span> Terminal
+        </div>
+      </div>
+      <div class="terminal-controls">
+        <div class="terminal-control control-close" onclick="window.close()"></div>
+        <div class="terminal-control control-minimize"></div>
+        <div class="terminal-control control-maximize" onclick="toggleFullscreen()"></div>
+      </div>
+    </div>
+    <div id="terminal-container"></div>
+  </div>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="footer-left">
+      <div class="shortcut">
+        <span class="key">Ctrl</span>+<span class="key">L</span> 지우기
+      </div>
+      <div class="shortcut">
+        <span class="key">Ctrl</span>+<span class="key">C</span> 중단
+      </div>
+    </div>
+    <div class="footer-right">
+      Your server. Your network. Your AI.
+    </div>
+  </footer>
+
+  <!-- Toast Container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script>
+    let socket;
+    let terminal;
+    let fitAddon;
+
+    // Initialize terminal
+    function initTerminal() {
+      terminal = new Terminal({
+        cursorBlink: true,
+        cursorStyle: 'bar',
+        fontSize: 14,
+        fontFamily: '"JetBrains Mono", "Fira Code", "SF Mono", Menlo, Monaco, "Courier New", monospace',
+        theme: {
+          background: '#0d1117',
+          foreground: '#e6edf3',
+          cursor: '#58a6ff',
+          cursorAccent: '#0d1117',
+          selection: 'rgba(88, 166, 255, 0.3)',
+          black: '#484f58',
+          red: '#ff7b72',
+          green: '#3fb950',
+          yellow: '#d29922',
+          blue: '#58a6ff',
+          magenta: '#bc8cff',
+          cyan: '#39c5cf',
+          white: '#b1bac4',
+          brightBlack: '#6e7681',
+          brightRed: '#ffa198',
+          brightGreen: '#56d364',
+          brightYellow: '#e3b341',
+          brightBlue: '#79c0ff',
+          brightMagenta: '#d2a8ff',
+          brightCyan: '#56d4dd',
+          brightWhite: '#f0f6fc'
+        },
+        allowTransparency: false,
+        scrollback: 10000,
+        tabStopWidth: 4
+      });
+
+      fitAddon = new FitAddon.FitAddon();
+      const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+      
+      terminal.loadAddon(fitAddon);
+      terminal.loadAddon(webLinksAddon);
+
+      terminal.open(document.getElementById('terminal-container'));
+      fitAddon.fit();
+
+      // Handle window resize
+      window.addEventListener('resize', () => {
+        fitAddon.fit();
+        if (socket?.connected) {
+          socket.emit('terminal:resize', {
+            cols: terminal.cols,
+            rows: terminal.rows
+          });
+        }
+      });
+
+      // Handle terminal input
+      terminal.onData((data) => {
+        if (socket?.connected) {
+          socket.emit('terminal:input', data);
+        }
+      });
+    }
+
+    // Connect to server
+    function connect() {
+      socket = io({
+        reconnection: true,
+        reconnectionAttempts: 10,
+        reconnectionDelay: 1000
+      });
+
+      socket.on('connect', () => {
+        console.log('Connected to server');
+        updateStatus(true);
+        
+        socket.emit('terminal:create', {
+          cols: terminal.cols,
+          rows: terminal.rows
+        });
+      });
+
+      socket.on('terminal:ready', (data) => {
+        console.log('Terminal ready, PID:', data.pid);
+        document.getElementById('loading').classList.add('hidden');
+        terminal.focus();
+        showToast('터미널 연결됨', 'success');
+      });
+
+      socket.on('terminal:data', (data) => {
+        terminal.write(data);
+      });
+
+      socket.on('terminal:exit', (code) => {
+        terminal.writeln(`\r\n\x1b[33m[프로세스 종료: ${code}]\x1b[0m`);
+        showToast('터미널 세션 종료됨', 'info');
+      });
+
+      socket.on('terminal:error', (error) => {
+        terminal.writeln(`\r\n\x1b[31m[오류: ${error}]\x1b[0m`);
+        showToast(error, 'error');
+      });
+
+      socket.on('disconnect', () => {
+        updateStatus(false);
+        showToast('연결 끊김', 'error');
+      });
+
+      socket.on('connect_error', (error) => {
+        console.error('Connection error:', error);
+        updateStatus(false);
+      });
+    }
+
+    // Update connection status
+    function updateStatus(connected) {
+      const dot = document.getElementById('status-dot');
+      const text = document.getElementById('status-text');
+      
+      if (connected) {
+        dot.classList.add('connected');
+        text.textContent = '연결됨';
+      } else {
+        dot.classList.remove('connected');
+        text.textContent = '연결 끊김';
+      }
+    }
+
+    // Reconnect
+    function reconnect() {
+      document.getElementById('loading').classList.remove('hidden');
+      if (socket) {
+        socket.disconnect();
+      }
+      terminal.clear();
+      connect();
+    }
+
+    // Clear terminal
+    function clearTerminal() {
+      terminal.clear();
+    }
+
+    // Request notification on completion
+    function notifyOnComplete() {
+      if (socket?.connected) {
+        socket.emit('terminal:notify-on-complete');
+        showToast('작업 완료 시 Discord로 알림을 보내드릴게요', 'info');
+      }
+    }
+
+    // Toggle fullscreen
+    function toggleFullscreen() {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen();
+      } else {
+        document.exitFullscreen();
+      }
+    }
+
+    // Show toast notification
+    function showToast(message, type = 'info') {
+      const container = document.getElementById('toast-container');
+      const toast = document.createElement('div');
+      toast.className = `toast ${type}`;
+      
+      const icons = {
+        success: '✅',
+        error: '❌',
+        info: 'ℹ️'
+      };
+      
+      toast.innerHTML = `${icons[type] || 'ℹ️'} ${message}`;
+      container.appendChild(toast);
+
+      setTimeout(() => {
+        toast.style.animation = 'slideIn 0.3s ease reverse';
+        setTimeout(() => toast.remove(), 300);
+      }, 3000);
+    }
+
+    // Initialize
+    document.addEventListener('DOMContentLoaded', () => {
+      initTerminal();
+      connect();
+    });
+
+    // Handle visibility change (for mobile)
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && socket && !socket.connected) {
+        reconnect();
+      }
+    });
+  </script>
+</body>
+</html>
