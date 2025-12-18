@@ -4,17 +4,14 @@ const { Server } = require('socket.io');
 const pty = require('node-pty');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 // Load config
 const configPath = path.join(__dirname, 'config.json');
 let config = {
   port: 3000,
   shell: process.env.SHELL || '/bin/bash',
-  workingDirectory: process.env.HOME || '/home',
-  discord: {
-    enabled: false,
-    webhookUrl: ''
-  }
+  workingDirectory: process.env.HOME || '/home'
 };
 
 if (fs.existsSync(configPath)) {
@@ -34,43 +31,147 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Discord notification function
-async function sendDiscordNotification(message) {
-  if (!config.discord?.enabled || !config.discord?.webhookUrl) {
-    return;
+// Circular Buffer for terminal output
+class CircularBuffer {
+  constructor(maxSize = 10 * 1024 * 1024) { // 10MB default
+    this.maxSize = maxSize;
+    this.buffer = [];
+    this.currentSize = 0;
   }
 
-  try {
-    const response = await fetch(config.discord.webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        content: message,
-        username: 'Terminal AI Control',
-        avatar_url: 'https://cdn-icons-png.flaticon.com/512/2593/2593635.png'
-      })
-    });
+  add(data) {
+    const dataSize = Buffer.byteLength(data, 'utf8');
+    this.buffer.push(data);
+    this.currentSize += dataSize;
 
-    if (!response.ok) {
-      console.error('Discord webhook failed:', response.status);
+    // Remove old data if exceeds max size
+    while (this.currentSize > this.maxSize && this.buffer.length > 0) {
+      const removed = this.buffer.shift();
+      this.currentSize -= Buffer.byteLength(removed, 'utf8');
     }
-  } catch (error) {
-    console.error('Discord notification error:', error.message);
+  }
+
+  getAll() {
+    return this.buffer.join('');
+  }
+
+  clear() {
+    this.buffer = [];
+    this.currentSize = 0;
   }
 }
 
-// Terminal sessions storage - Map of socket.id -> Map of terminal.id -> terminal data
-const terminals = new Map();
+// Session-based storage (persists across reconnects)
+// sessionId -> { socket, terminals, lastActivity }
+const sessions = new Map();
+// Socket to session mapping
+const socketToSession = new Map();
 let terminalIdCounter = 0;
+
+// Session timeout: 1 hour
+const SESSION_TIMEOUT = 60 * 60 * 1000;
+
+// Generate unique session ID
+function generateSessionId() {
+  return crypto.randomUUID();
+}
+
+// Clean up expired sessions
+function cleanupExpiredSessions() {
+  const now = Date.now();
+  for (const [sessionId, session] of sessions.entries()) {
+    if (now - session.lastActivity > SESSION_TIMEOUT) {
+      console.log(`[Session] Cleaning up expired session: ${sessionId}`);
+      // Kill all terminal processes
+      session.terminals.forEach((term) => {
+        if (term.pty) {
+          term.pty.kill();
+        }
+      });
+      sessions.delete(sessionId);
+    }
+  }
+}
+
+// Run cleanup every 10 minutes
+setInterval(cleanupExpiredSessions, 10 * 60 * 1000);
 
 io.on('connection', (socket) => {
   console.log(`Client connected: ${socket.id}`);
+  let sessionId = null;
+  let session = null;
 
-  // Initialize terminals map for this socket
-  terminals.set(socket.id, new Map());
+  // Handle session initialization
+  socket.on('session:init', ({ sessionId: clientSessionId }) => {
+    console.log(`[Session] Init request with sessionId: ${clientSessionId || 'none'}`);
+
+    // Check if client has existing session
+    if (clientSessionId && sessions.has(clientSessionId)) {
+      // Reconnect to existing session
+      sessionId = clientSessionId;
+      session = sessions.get(sessionId);
+
+      // Disconnect previous socket if exists
+      if (session.socket && session.socket.id !== socket.id) {
+        console.log(`[Session] Disconnecting previous socket for session ${sessionId}`);
+        session.socket.emit('session:replaced', { message: '다른 곳에서 접속했습니다' });
+        session.socket.disconnect();
+      }
+
+      // Update session with new socket
+      session.socket = socket;
+      session.lastActivity = Date.now();
+      socketToSession.set(socket.id, sessionId);
+
+      console.log(`[Session] Reconnected to session ${sessionId} with ${session.terminals.size} terminals`);
+
+      // Send session info and existing terminals
+      const terminalList = Array.from(session.terminals.entries()).map(([tid, term]) => ({
+        terminalId: tid,
+        pid: term.pty.pid,
+        tabNumber: term.tabNumber,
+        customName: term.customName
+      }));
+
+      socket.emit('session:restored', {
+        sessionId,
+        terminals: terminalList
+      });
+
+      // Send buffered output for each terminal
+      session.terminals.forEach((term, tid) => {
+        const bufferedOutput = term.outputBuffer.getAll();
+        if (bufferedOutput) {
+          console.log(`[Session] Sending ${bufferedOutput.length} bytes of buffered output for ${tid}`);
+          socket.emit('terminal:buffered', { terminalId: tid, data: bufferedOutput });
+        }
+      });
+
+    } else {
+      // Create new session
+      sessionId = generateSessionId();
+      session = {
+        socket: socket,
+        terminals: new Map(),
+        lastActivity: Date.now(),
+        tabCounter: 0
+      };
+      sessions.set(sessionId, session);
+      socketToSession.set(socket.id, sessionId);
+
+      console.log(`[Session] Created new session ${sessionId}`);
+
+      socket.emit('session:created', { sessionId });
+    }
+  });
 
   // Create new terminal session
   socket.on('terminal:create', (options = {}) => {
+    if (!session) {
+      socket.emit('terminal:error', 'No active session. Please initialize session first.');
+      return;
+    }
+
     const cols = options.cols || 80;
     const rows = options.rows || 24;
     const cwd = options.cwd || config.workingDirectory;
@@ -89,41 +190,37 @@ io.on('connection', (socket) => {
         }
       });
 
-      const socketTerminals = terminals.get(socket.id);
-      socketTerminals.set(terminalId, {
+      const term = {
         pty: ptyProcess,
         lastActivity: Date.now(),
-        commandBuffer: ''
-      });
+        outputBuffer: new CircularBuffer(),
+        tabNumber: ++session.tabCounter,
+        customName: null
+      };
+
+      session.terminals.set(terminalId, term);
 
       // Send terminal output to client
       ptyProcess.onData((data) => {
-        socket.emit('terminal:data', { terminalId, data });
+        // Add to output buffer
+        term.outputBuffer.add(data);
+        term.lastActivity = Date.now();
 
-        const term = socketTerminals.get(terminalId);
-        if (term) {
-          term.lastActivity = Date.now();
-          term.commandBuffer += data;
-
-          // Detect command completion patterns for notifications
-          // This is a simple heuristic - looks for shell prompt patterns
-          if (term.notifyOnComplete &&
-              (data.includes('$ ') || data.includes('# ') || data.includes('> '))) {
-            const outputPreview = term.commandBuffer.slice(-200).trim();
-            sendDiscordNotification(`✅ **작업 완료**\n\`\`\`\n${outputPreview}\n\`\`\``);
-            term.notifyOnComplete = false;
-            term.commandBuffer = '';
-          }
+        // Send to client if connected
+        if (session.socket && session.socket.connected) {
+          session.socket.emit('terminal:data', { terminalId, data });
         }
       });
 
       ptyProcess.onExit(({ exitCode }) => {
-        socket.emit('terminal:exit', { terminalId, exitCode });
-        socketTerminals.delete(terminalId);
+        if (session.socket && session.socket.connected) {
+          session.socket.emit('terminal:exit', { terminalId, exitCode });
+        }
+        session.terminals.delete(terminalId);
       });
 
-      socket.emit('terminal:ready', { terminalId, pid: ptyProcess.pid });
-      console.log(`Terminal ${terminalId} created for ${socket.id}, PID: ${ptyProcess.pid}`);
+      socket.emit('terminal:ready', { terminalId, pid: ptyProcess.pid, tabNumber: term.tabNumber, customName: term.customName });
+      console.log(`Terminal ${terminalId} created for session ${sessionId}, PID: ${ptyProcess.pid}`);
 
     } catch (error) {
       console.error('Failed to create terminal:', error);
@@ -133,23 +230,17 @@ io.on('connection', (socket) => {
 
   // Handle input from client
   socket.on('terminal:input', ({ terminalId, data }) => {
-    const socketTerminals = terminals.get(socket.id);
-    const term = socketTerminals?.get(terminalId);
+    if (!session) return;
+    const term = session.terminals.get(terminalId);
     if (term?.pty) {
       term.pty.write(data);
-
-      // If Enter key is pressed, mark for notification
-      if (data === '\r' || data === '\n') {
-        term.notifyOnComplete = config.discord?.enabled;
-        term.commandBuffer = '';
-      }
     }
   });
 
   // Resize terminal
   socket.on('terminal:resize', ({ terminalId, cols, rows }) => {
-    const socketTerminals = terminals.get(socket.id);
-    const term = socketTerminals?.get(terminalId);
+    if (!session) return;
+    const term = session.terminals.get(terminalId);
     if (term?.pty) {
       term.pty.resize(cols, rows);
     }
@@ -157,46 +248,45 @@ io.on('connection', (socket) => {
 
   // Close specific terminal
   socket.on('terminal:close', ({ terminalId }) => {
-    const socketTerminals = terminals.get(socket.id);
-    const term = socketTerminals?.get(terminalId);
+    if (!session) return;
+    const term = session.terminals.get(terminalId);
     if (term?.pty) {
       term.pty.kill();
-      socketTerminals.delete(terminalId);
-      console.log(`Terminal ${terminalId} closed for ${socket.id}`);
+      session.terminals.delete(terminalId);
+      console.log(`Terminal ${terminalId} closed for session ${sessionId}`);
     }
   });
 
-  // Request notification for long-running task
-  socket.on('terminal:notify-on-complete', ({ terminalId }) => {
-    const socketTerminals = terminals.get(socket.id);
-    const term = socketTerminals?.get(terminalId);
+  // Rename terminal
+  socket.on('terminal:rename', ({ terminalId, customName }) => {
+    if (!session) return;
+    const term = session.terminals.get(terminalId);
     if (term) {
-      term.notifyOnComplete = true;
-      term.commandBuffer = '';
-      sendDiscordNotification('⏳ **작업 시작됨** - 완료 시 알림을 보내드릴게요.');
+      term.customName = customName || null;
+      console.log(`Terminal ${terminalId} renamed to: ${customName || 'default'}`);
     }
   });
 
-  // Cleanup on disconnect
+  // Cleanup on disconnect (DO NOT kill PTY processes - keep session alive)
   socket.on('disconnect', () => {
     console.log(`Client disconnected: ${socket.id}`);
-    const socketTerminals = terminals.get(socket.id);
-    if (socketTerminals) {
-      socketTerminals.forEach((term) => {
-        if (term?.pty) {
-          term.pty.kill();
-        }
-      });
-      terminals.delete(socket.id);
+
+    if (sessionId && session) {
+      // Clear socket reference but keep session alive
+      console.log(`[Session] Socket disconnected but session ${sessionId} kept alive with ${session.terminals.size} terminals`);
+      session.socket = null;
+      session.lastActivity = Date.now();
     }
+
+    socketToSession.delete(socket.id);
   });
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('Shutting down...');
-  terminals.forEach((socketTerminals) => {
-    socketTerminals.forEach((term) => {
+  sessions.forEach((session) => {
+    session.terminals.forEach((term) => {
       if (term.pty) term.pty.kill();
     });
   });
@@ -217,8 +307,4 @@ server.listen(config.port, '0.0.0.0', () => {
 ║                                                            ║
 ╚════════════════════════════════════════════════════════════╝
   `);
-  
-  if (config.discord?.enabled) {
-    sendDiscordNotification('🚀 **Terminal AI Control** 서버가 시작되었습니다.');
-  }
 });

@@ -39,17 +39,6 @@
         </button>
       </div>
     </div>
-    <div class="header-actions">
-      <div class="toggle-container">
-        <label class="toggle-label">
-          🔔 <span id="notification-text">알림</span>
-        </label>
-        <label class="toggle-switch">
-          <input type="checkbox" id="notification-toggle" onchange="toggleNotification()">
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-    </div>
   </header>
 
   <!-- Terminal -->
@@ -89,8 +78,21 @@
     let socket;
     let terminals = new Map(); // Map of terminalId -> { terminal, fitAddon }
     let activeTerminalId = null;
-    let notificationEnabled = false;
     let tabCounter = 0;
+    let sessionId = getCookie('sessionId') || null; // Session ID for persistence
+
+    // Cookie helper functions
+    function setCookie(name, value, days = 365) {
+      const expires = new Date(Date.now() + days * 864e5).toUTCString();
+      document.cookie = name + '=' + encodeURIComponent(value) + '; expires=' + expires + '; path=/';
+    }
+
+    function getCookie(name) {
+      return document.cookie.split('; ').reduce((r, v) => {
+        const parts = v.split('=');
+        return parts[0] === name ? decodeURIComponent(parts[1]) : r;
+      }, '');
+    }
 
     // Create a new terminal instance
     function createTerminalInstance() {
@@ -275,13 +277,109 @@
         console.log('Connected to server');
         updateStatus(true);
 
+        // Send initial visibility state
+        socket.emit('page:visibility', { hidden: document.hidden });
+
+        // Initialize or restore session
+        console.log('Requesting session init with ID:', sessionId || 'none');
+        socket.emit('session:init', { sessionId });
+      });
+
+      // Session created (new session)
+      socket.on('session:created', ({ sessionId: newSessionId }) => {
+        console.log('New session created:', newSessionId);
+        sessionId = newSessionId;
+        setCookie('sessionId', sessionId);
+
         // Create first terminal
         addTerminalTab();
       });
 
+      // Session restored (reconnected to existing session)
+      socket.on('session:restored', ({ sessionId: restoredSessionId, terminals: terminalList }) => {
+        console.log('Session restored:', restoredSessionId, 'with terminals:', terminalList);
+        sessionId = restoredSessionId;
+
+        // Clear existing terminals
+        terminals.forEach(term => {
+          if (term.terminal) {
+            term.terminal.dispose();
+          }
+        });
+        terminals.clear();
+        tabCounter = 0;
+
+        // Recreate terminal instances for each restored terminal
+        terminalList.forEach(termInfo => {
+          const { terminalId, pid, tabNumber } = termInfo;
+
+          // Create terminal instance
+          const { terminal, fitAddon } = createTerminalInstance();
+
+          // Open terminal in container (hidden initially)
+          terminal.open(document.getElementById('terminal-container'));
+          terminal.element.style.display = 'none';
+          fitAddon.fit();
+
+          // Handle terminal input
+          terminal.onData((inputData) => {
+            if (socket?.connected) {
+              socket.emit('terminal:input', {
+                terminalId,
+                data: inputData
+              });
+            }
+          });
+
+          // Store terminal
+          terminals.set(terminalId, {
+            terminal,
+            fitAddon,
+            tabNumber: tabNumber,
+            customName: termInfo.customName
+          });
+
+          // Update tab counter
+          if (tabNumber > tabCounter) {
+            tabCounter = tabNumber;
+          }
+        });
+
+        // Render tabs
+        renderTabs();
+
+        // Switch to first terminal
+        if (terminalList.length > 0) {
+          switchTerminal(terminalList[0].terminalId);
+        }
+
+        // Hide loading
+        document.getElementById('loading').classList.add('hidden');
+
+        // Show restored message
+        showToast(`세션 복구됨: ${terminalList.length}개 터미널`, 'success');
+      });
+
+      // Receive buffered output
+      socket.on('terminal:buffered', ({ terminalId, data }) => {
+        console.log(`Received buffered output for ${terminalId}:`, data.length, 'bytes');
+        const termData = terminals.get(terminalId);
+        if (termData?.terminal) {
+          termData.terminal.write(data);
+        }
+      });
+
+      // Session replaced (logged in from another location)
+      socket.on('session:replaced', ({ message }) => {
+        showToast(message, 'error');
+        setTimeout(() => {
+          window.location.reload();
+        }, 2000);
+      });
+
       socket.on('terminal:ready', (data) => {
         console.log('Terminal ready:', data);
-        const { terminalId, pid } = data;
+        const { terminalId, pid, tabNumber, customName } = data;
 
         // Create terminal instance
         const { terminal, fitAddon } = createTerminalInstance();
@@ -300,12 +398,18 @@
           }
         });
 
-        // Store terminal
+        // Store terminal (use server's tabNumber)
         terminals.set(terminalId, {
           terminal,
           fitAddon,
-          tabNumber: ++tabCounter
+          tabNumber: tabNumber,
+          customName: customName
         });
+
+        // Update local tab counter
+        if (tabNumber > tabCounter) {
+          tabCounter = tabNumber;
+        }
 
         // Hide loading on first terminal
         if (terminals.size === 1) {
@@ -316,7 +420,7 @@
         renderTabs();
         switchTerminal(terminalId);
 
-        showToast(`터미널 ${tabCounter} 연결됨`, 'success');
+        showToast(`터미널 ${tabNumber} 연결됨`, 'success');
       });
 
       socket.on('terminal:data', ({ terminalId, data }) => {
@@ -402,28 +506,6 @@
       connect();
     }
 
-    // Toggle notification
-    function toggleNotification() {
-      const toggle = document.getElementById('notification-toggle');
-
-      if (!activeTerminalId) {
-        showToast('활성 터미널이 없습니다', 'error');
-        toggle.checked = false;
-        return;
-      }
-
-      notificationEnabled = toggle.checked;
-
-      if (notificationEnabled) {
-        if (socket?.connected) {
-          socket.emit('terminal:notify-on-complete', { terminalId: activeTerminalId });
-          showToast('작업 완료 시 Discord로 알림을 보내드릴게요', 'info');
-        }
-      } else {
-        showToast('알림이 비활성화되었습니다', 'info');
-      }
-    }
-
     // Toggle fullscreen
     function toggleFullscreen() {
       if (!document.fullscreenElement) {
@@ -459,8 +541,9 @@
       connect();
     });
 
-    // Handle visibility change (for mobile)
+    // Handle visibility change
     document.addEventListener('visibilitychange', () => {
+      // Reconnect if page becomes visible and socket is disconnected
       if (!document.hidden && socket && !socket.connected) {
         reconnect();
       }
