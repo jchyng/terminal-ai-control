@@ -59,17 +59,22 @@ async function sendDiscordNotification(message) {
   }
 }
 
-// Terminal sessions storage
+// Terminal sessions storage - Map of socket.id -> Map of terminal.id -> terminal data
 const terminals = new Map();
+let terminalIdCounter = 0;
 
 io.on('connection', (socket) => {
   console.log(`Client connected: ${socket.id}`);
+
+  // Initialize terminals map for this socket
+  terminals.set(socket.id, new Map());
 
   // Create new terminal session
   socket.on('terminal:create', (options = {}) => {
     const cols = options.cols || 80;
     const rows = options.rows || 24;
     const cwd = options.cwd || config.workingDirectory;
+    const terminalId = `term-${++terminalIdCounter}`;
 
     try {
       const ptyProcess = pty.spawn(config.shell, [], {
@@ -84,7 +89,8 @@ io.on('connection', (socket) => {
         }
       });
 
-      terminals.set(socket.id, {
+      const socketTerminals = terminals.get(socket.id);
+      socketTerminals.set(terminalId, {
         pty: ptyProcess,
         lastActivity: Date.now(),
         commandBuffer: ''
@@ -92,16 +98,16 @@ io.on('connection', (socket) => {
 
       // Send terminal output to client
       ptyProcess.onData((data) => {
-        socket.emit('terminal:data', data);
-        
-        const term = terminals.get(socket.id);
+        socket.emit('terminal:data', { terminalId, data });
+
+        const term = socketTerminals.get(terminalId);
         if (term) {
           term.lastActivity = Date.now();
           term.commandBuffer += data;
-          
+
           // Detect command completion patterns for notifications
           // This is a simple heuristic - looks for shell prompt patterns
-          if (term.notifyOnComplete && 
+          if (term.notifyOnComplete &&
               (data.includes('$ ') || data.includes('# ') || data.includes('> '))) {
             const outputPreview = term.commandBuffer.slice(-200).trim();
             sendDiscordNotification(`✅ **작업 완료**\n\`\`\`\n${outputPreview}\n\`\`\``);
@@ -112,12 +118,12 @@ io.on('connection', (socket) => {
       });
 
       ptyProcess.onExit(({ exitCode }) => {
-        socket.emit('terminal:exit', exitCode);
-        terminals.delete(socket.id);
+        socket.emit('terminal:exit', { terminalId, exitCode });
+        socketTerminals.delete(terminalId);
       });
 
-      socket.emit('terminal:ready', { pid: ptyProcess.pid });
-      console.log(`Terminal created for ${socket.id}, PID: ${ptyProcess.pid}`);
+      socket.emit('terminal:ready', { terminalId, pid: ptyProcess.pid });
+      console.log(`Terminal ${terminalId} created for ${socket.id}, PID: ${ptyProcess.pid}`);
 
     } catch (error) {
       console.error('Failed to create terminal:', error);
@@ -126,11 +132,12 @@ io.on('connection', (socket) => {
   });
 
   // Handle input from client
-  socket.on('terminal:input', (data) => {
-    const term = terminals.get(socket.id);
+  socket.on('terminal:input', ({ terminalId, data }) => {
+    const socketTerminals = terminals.get(socket.id);
+    const term = socketTerminals?.get(terminalId);
     if (term?.pty) {
       term.pty.write(data);
-      
+
       // If Enter key is pressed, mark for notification
       if (data === '\r' || data === '\n') {
         term.notifyOnComplete = config.discord?.enabled;
@@ -140,16 +147,29 @@ io.on('connection', (socket) => {
   });
 
   // Resize terminal
-  socket.on('terminal:resize', ({ cols, rows }) => {
-    const term = terminals.get(socket.id);
+  socket.on('terminal:resize', ({ terminalId, cols, rows }) => {
+    const socketTerminals = terminals.get(socket.id);
+    const term = socketTerminals?.get(terminalId);
     if (term?.pty) {
       term.pty.resize(cols, rows);
     }
   });
 
+  // Close specific terminal
+  socket.on('terminal:close', ({ terminalId }) => {
+    const socketTerminals = terminals.get(socket.id);
+    const term = socketTerminals?.get(terminalId);
+    if (term?.pty) {
+      term.pty.kill();
+      socketTerminals.delete(terminalId);
+      console.log(`Terminal ${terminalId} closed for ${socket.id}`);
+    }
+  });
+
   // Request notification for long-running task
-  socket.on('terminal:notify-on-complete', () => {
-    const term = terminals.get(socket.id);
+  socket.on('terminal:notify-on-complete', ({ terminalId }) => {
+    const socketTerminals = terminals.get(socket.id);
+    const term = socketTerminals?.get(terminalId);
     if (term) {
       term.notifyOnComplete = true;
       term.commandBuffer = '';
@@ -160,9 +180,13 @@ io.on('connection', (socket) => {
   // Cleanup on disconnect
   socket.on('disconnect', () => {
     console.log(`Client disconnected: ${socket.id}`);
-    const term = terminals.get(socket.id);
-    if (term?.pty) {
-      term.pty.kill();
+    const socketTerminals = terminals.get(socket.id);
+    if (socketTerminals) {
+      socketTerminals.forEach((term) => {
+        if (term?.pty) {
+          term.pty.kill();
+        }
+      });
       terminals.delete(socket.id);
     }
   });
@@ -171,8 +195,10 @@ io.on('connection', (socket) => {
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('Shutting down...');
-  terminals.forEach((term) => {
-    if (term.pty) term.pty.kill();
+  terminals.forEach((socketTerminals) => {
+    socketTerminals.forEach((term) => {
+      if (term.pty) term.pty.kill();
+    });
   });
   server.close();
   process.exit(0);
