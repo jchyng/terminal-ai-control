@@ -219,6 +219,26 @@ body {
   color: var(--text-primary);
 }
 
+.tab-label {
+  outline: none;
+  border-radius: 3px;
+  padding: 2px 4px;
+  margin: -2px -4px; /* Counteract padding to maintain size */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 150px;
+}
+
+.tab-label[contenteditable="true"] {
+  border: 1px solid var(--accent-color); /* Use border instead of outline */
+  background-color: var(--bg-primary);
+  cursor: text;
+  overflow: visible;
+  padding: 1px 3px; /* Slightly adjust padding for border */
+  margin: -1px -3px; /* Adjust margin to keep size */
+}
+
 .terminal-controls {
   display: flex;
   gap: 8px;

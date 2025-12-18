@@ -240,10 +240,58 @@
         const tab = document.createElement('div');
         tab.className = 'terminal-tab';
         tab.setAttribute('data-terminal-id', terminalId);
+        
+        const label = document.createElement('span');
+        label.className = 'tab-label';
+        label.textContent = termData.customName || `터미널 ${termData.tabNumber}`;
+        
+        // Handle renaming on double-click
+        tab.ondblclick = () => {
+          // Temporarily disable the single-click handler to prevent switching
+          tab.onclick = null; 
+          label.contentEditable = true;
+          label.focus();
+          document.execCommand('selectAll', false, null);
+
+          const saveName = () => {
+            label.contentEditable = false;
+            // Re-enable the single-click handler
+            tab.onclick = () => switchTerminal(terminalId);
+
+            const newName = label.textContent.trim();
+            
+            // Update only if the name has actually changed
+            if (newName && newName !== (termData.customName || `터미널 ${termData.tabNumber}`)) {
+              termData.customName = newName;
+              socket.emit('terminal:rename', { terminalId, customName: newName });
+              showToast(`터미널 이름이 "${newName}"(으)로 변경되었습니다.`, 'success');
+            } else {
+              // If the name is empty or unchanged, restore the original text
+              label.textContent = termData.customName || `터미널 ${termData.tabNumber}`;
+            }
+          };
+
+          // Save when focus is lost
+          label.onblur = saveName;
+          
+          // Save on Enter, cancel on Escape
+          label.onkeydown = (e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              saveName();
+            } else if (e.key === 'Escape') {
+              label.contentEditable = false;
+              // Restore original name and exit edit mode
+              label.textContent = termData.customName || `터미널 ${termData.tabNumber}`;
+              tab.onclick = () => switchTerminal(terminalId);
+              label.blur(); // Trigger blur to clean up other listeners
+            }
+          };
+        };
+
+        // Set the initial single-click handler
         tab.onclick = () => switchTerminal(terminalId);
 
-        const label = document.createElement('span');
-        label.textContent = `Terminal ${termData.tabNumber}`;
         tab.appendChild(label);
 
         const closeBtn = document.createElement('span');
