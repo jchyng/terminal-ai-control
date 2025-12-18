@@ -14,7 +14,6 @@
 - **🌐 어디서든 접속** - Tailscale로 회사, LTE, 5G 어디서든 안전하게 접근
 - **🔒 보안** - SSH/터미널 웹 노출 없음, 포트 공개 불필요
 - **📱 모바일 최적화** - 반응형 UI로 폰에서도 편하게 사용
-- **🔔 Discord 알림** - 작업 완료 시 자동 알림
 
 ## 🚀 빠른 시작
 
@@ -63,11 +62,7 @@ nano config.json  # 또는 vim, code 등
 {
   "port": 3000,
   "shell": "/bin/bash",
-  "workingDirectory": "/home/yourname/projects",
-  "discord": {
-    "enabled": true,
-    "webhookUrl": "https://discord.com/api/webhooks/YOUR_WEBHOOK_URL"
-  }
+  "workingDirectory": "/home/yourname/projects"
 }
 ```
 
@@ -114,35 +109,7 @@ http://100.64.0.1:3000
 ✅ 이제 **회사, LTE, 5G** 어디서든 접근 가능!  
 ✅ 서버 포트 인터넷 공개 **불필요**
 
----
 
-## 🔔 Discord 알림 설정
-
-### 1. Discord Webhook 생성
-
-1. Discord 서버에서 **서버 설정** → **연동** → **웹후크**
-2. **새 웹후크** 클릭
-3. 이름 설정 (예: "Terminal AI")
-4. 채널 선택
-5. **웹후크 URL 복사**
-
-### 2. config.json에 적용
-
-```json
-{
-  "discord": {
-    "enabled": true,
-    "webhookUrl": "https://discord.com/api/webhooks/1234567890/abcdefg..."
-  }
-}
-```
-
-### 3. 알림 받기
-
-- **자동**: 명령 실행 완료 시 결과 요약
-- **수동**: 웹 UI에서 🔔 버튼 클릭 → 현재 작업 완료 시 알림
-
----
 
 ## 🔧 systemd로 자동 시작 설정
 
@@ -238,8 +205,6 @@ terminal-ai-control/
 | `port` | 웹 서버 포트 | `3000` |
 | `shell` | 사용할 쉘 | `/bin/bash` |
 | `workingDirectory` | 터미널 시작 디렉터리 | `$HOME` |
-| `discord.enabled` | Discord 알림 사용 | `false` |
-| `discord.webhookUrl` | Discord Webhook URL | `""` |
 
 ---
 
