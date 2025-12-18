@@ -6,6 +6,34 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
+// Create logs directory if it doesn't exist
+const logsDir = path.join(__dirname, 'logs');
+if (!fs.existsSync(logsDir)) {
+  fs.mkdirSync(logsDir, { recursive: true });
+}
+
+// Logger utility
+const logger = {
+  info: (message, meta = {}) => {
+    const timestamp = new Date().toISOString();
+    console.log(JSON.stringify({ level: 'info', timestamp, message, ...meta }));
+  },
+  warn: (message, meta = {}) => {
+    const timestamp = new Date().toISOString();
+    console.warn(JSON.stringify({ level: 'warn', timestamp, message, ...meta }));
+  },
+  error: (message, meta = {}) => {
+    const timestamp = new Date().toISOString();
+    console.error(JSON.stringify({ level: 'error', timestamp, message, ...meta }));
+  },
+  debug: (message, meta = {}) => {
+    const timestamp = new Date().toISOString();
+    if (process.env.DEBUG) {
+      console.log(JSON.stringify({ level: 'debug', timestamp, message, ...meta }));
+    }
+  }
+};
+
 // Load config
 const configPath = path.join(__dirname, 'config.json');
 let config = {
@@ -81,7 +109,7 @@ function cleanupExpiredSessions() {
   const now = Date.now();
   for (const [sessionId, session] of sessions.entries()) {
     if (now - session.lastActivity > SESSION_TIMEOUT) {
-      console.log(`[Session] Cleaning up expired session: ${sessionId}`);
+      logger.info('Cleaning up expired session', { sessionId, terminalCount: session.terminals.size });
       // Kill all terminal processes
       session.terminals.forEach((term) => {
         if (term.pty) {
@@ -96,14 +124,71 @@ function cleanupExpiredSessions() {
 // Run cleanup every 10 minutes
 setInterval(cleanupExpiredSessions, 10 * 60 * 1000);
 
+// --- Helper function for file tree ---
+const ignoredDirs = new Set(['node_modules', '.git', '.vscode', '__pycache__']);
+
+async function readDirectoryRecursive(dirPath) {
+    const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+    const tree = [];
+
+    for (const entry of entries) {
+        if (ignoredDirs.has(entry.name)) {
+            continue;
+        }
+
+        const fullPath = path.join(dirPath, entry.name);
+        try {
+            if (entry.isDirectory()) {
+                tree.push({
+                    name: entry.name,
+                    path: fullPath,
+                    type: 'directory',
+                    children: await readDirectoryRecursive(fullPath)
+                });
+            } else {
+                tree.push({
+                    name: entry.name,
+                    path: fullPath,
+                    type: 'file'
+                });
+            }
+        } catch (err) {
+            if (err.code === 'EACCES' && entry.isDirectory()) {
+                // If it's a directory we can't access, note it in the tree
+                tree.push({
+                    name: entry.name,
+                    path: fullPath,
+                    type: 'directory',
+                    error: 'permission_denied',
+                    children: []
+                });
+            } else {
+                // For other errors, or for files we can't read, just log and skip
+                logger.warn('Could not read path', { path: fullPath, error: err.message });
+            }
+        }
+    }
+    
+    // Sort directories first, then files, all alphabetically
+    tree.sort((a, b) => {
+        if (a.type === b.type) {
+            return a.name.localeCompare(b.name);
+        }
+        return a.type === 'directory' ? -1 : 1;
+    });
+
+    return tree;
+}
+// --- End Helper function ---
+
 io.on('connection', (socket) => {
-  console.log(`Client connected: ${socket.id}`);
+  logger.info('Client connected', { socketId: socket.id });
   let sessionId = null;
   let session = null;
 
   // Handle session initialization
   socket.on('session:init', ({ sessionId: clientSessionId }) => {
-    console.log(`[Session] Init request with sessionId: ${clientSessionId || 'none'}`);
+    logger.info('Session init request', { clientSessionId: clientSessionId || 'none' });
 
     // Check if client has existing session
     if (clientSessionId && sessions.has(clientSessionId)) {
@@ -113,7 +198,7 @@ io.on('connection', (socket) => {
 
       // Disconnect previous socket if exists
       if (session.socket && session.socket.id !== socket.id) {
-        console.log(`[Session] Disconnecting previous socket for session ${sessionId}`);
+        logger.info('Disconnecting previous socket for session', { sessionId, oldSocketId: session.socket.id });
         session.socket.emit('session:replaced', { message: '다른 곳에서 접속했습니다' });
         session.socket.disconnect();
       }
@@ -123,7 +208,7 @@ io.on('connection', (socket) => {
       session.lastActivity = Date.now();
       socketToSession.set(socket.id, sessionId);
 
-      console.log(`[Session] Reconnected to session ${sessionId} with ${session.terminals.size} terminals`);
+      logger.info('Session reconnected', { sessionId, terminalCount: session.terminals.size });
 
       // Send session info and existing terminals
       const terminalList = Array.from(session.terminals.entries()).map(([tid, term]) => ({
@@ -135,14 +220,15 @@ io.on('connection', (socket) => {
 
       socket.emit('session:restored', {
         sessionId,
-        terminals: terminalList
+        terminals: terminalList,
+        workingDirectory: config.workingDirectory // Send initial CWD
       });
 
       // Send buffered output for each terminal
       session.terminals.forEach((term, tid) => {
         const bufferedOutput = term.outputBuffer.getAll();
         if (bufferedOutput) {
-          console.log(`[Session] Sending ${bufferedOutput.length} bytes of buffered output for ${tid}`);
+          logger.debug('Sending buffered output', { terminalId: tid, bytes: bufferedOutput.length });
           socket.emit('terminal:buffered', { terminalId: tid, data: bufferedOutput });
         }
       });
@@ -159,9 +245,35 @@ io.on('connection', (socket) => {
       sessions.set(sessionId, session);
       socketToSession.set(socket.id, sessionId);
 
-      console.log(`[Session] Created new session ${sessionId}`);
+      logger.info('New session created', { sessionId });
 
-      socket.emit('session:created', { sessionId });
+      socket.emit('session:created', { sessionId, workingDirectory: config.workingDirectory });
+    }
+  });
+
+  // Handle file tree requests
+  socket.on('filetree:get', async ({ targetPath }) => {
+    if (!session) {
+      socket.emit('filetree:error', 'No active session.');
+      return;
+    }
+    
+    // Use the project's root working directory as the base
+    const basePath = config.workingDirectory;
+    
+    // Security check to prevent directory traversal above the configured working directory
+    const requestedPath = targetPath ? path.resolve(targetPath) : path.resolve(basePath);
+    if (!requestedPath.startsWith(path.resolve(basePath))) {
+        socket.emit('filetree:error', 'Access denied: Path is outside the working directory.');
+        return;
+    }
+
+    try {
+      const tree = await readDirectoryRecursive(requestedPath);
+      socket.emit('filetree:data', { path: requestedPath, tree });
+    } catch (error) {
+      logger.error('File tree error', { path: requestedPath, error: error.message });
+      socket.emit('filetree:error', `Failed to read directory: ${error.message}`);
     }
   });
 
@@ -186,7 +298,8 @@ io.on('connection', (socket) => {
         env: {
           ...process.env,
           TERM: 'xterm-256color',
-          COLORTERM: 'truecolor'
+          COLORTERM: 'truecolor',
+          PROMPT_COMMAND: 'printf "\\033]777;CWD=%s\\007" "$(pwd)"'
         }
       });
 
@@ -220,10 +333,10 @@ io.on('connection', (socket) => {
       });
 
       socket.emit('terminal:ready', { terminalId, pid: ptyProcess.pid, tabNumber: term.tabNumber, customName: term.customName });
-      console.log(`Terminal ${terminalId} created for session ${sessionId}, PID: ${ptyProcess.pid}`);
+      logger.info('Terminal created', { terminalId, sessionId, pid: ptyProcess.pid, tabNumber: term.tabNumber });
 
     } catch (error) {
-      console.error('Failed to create terminal:', error);
+      logger.error('Failed to create terminal', { error: error.message, stack: error.stack });
       socket.emit('terminal:error', error.message);
     }
   });
@@ -253,7 +366,7 @@ io.on('connection', (socket) => {
     if (term?.pty) {
       term.pty.kill();
       session.terminals.delete(terminalId);
-      console.log(`Terminal ${terminalId} closed for session ${sessionId}`);
+      logger.info('Terminal closed', { terminalId, sessionId });
     }
   });
 
@@ -263,17 +376,17 @@ io.on('connection', (socket) => {
     const term = session.terminals.get(terminalId);
     if (term) {
       term.customName = customName || null;
-      console.log(`Terminal ${terminalId} renamed to: ${customName || 'default'}`);
+      logger.info('Terminal renamed', { terminalId, customName: customName || 'default' });
     }
   });
 
   // Cleanup on disconnect (DO NOT kill PTY processes - keep session alive)
   socket.on('disconnect', () => {
-    console.log(`Client disconnected: ${socket.id}`);
+    logger.info('Client disconnected', { socketId: socket.id });
 
     if (sessionId && session) {
       // Clear socket reference but keep session alive
-      console.log(`[Session] Socket disconnected but session ${sessionId} kept alive with ${session.terminals.size} terminals`);
+      logger.info('Session kept alive after disconnect', { sessionId, terminalCount: session.terminals.size });
       session.socket = null;
       session.lastActivity = Date.now();
     }
@@ -284,18 +397,20 @@ io.on('connection', (socket) => {
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('Shutting down...');
+  logger.info('Shutting down server', { totalSessions: sessions.size });
   sessions.forEach((session) => {
     session.terminals.forEach((term) => {
       if (term.pty) term.pty.kill();
     });
   });
-  server.close();
-  process.exit(0);
+  server.close(() => {
+    logger.info('Server closed successfully');
+    process.exit(0);
+  });
 });
 
 server.listen(config.port, '0.0.0.0', () => {
-  console.log(`
+  const banner = `
 ╔════════════════════════════════════════════════════════════╗
 ║                                                            ║
 ║   🖥️  Terminal AI Control Plane                            ║
@@ -306,5 +421,13 @@ server.listen(config.port, '0.0.0.0', () => {
 ║   No cloud. No SSH in the browser.                         ║
 ║                                                            ║
 ╚════════════════════════════════════════════════════════════╝
-  `);
+  `;
+  console.log(banner);
+  logger.info('Server started successfully', {
+    port: config.port,
+    shell: config.shell,
+    workingDirectory: config.workingDirectory,
+    nodeVersion: process.version,
+    platform: process.platform
+  });
 });
