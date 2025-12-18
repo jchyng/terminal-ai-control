@@ -27,6 +27,9 @@
   <!-- Header -->
   <header class="header">
     <div class="header-left">
+      <button id="toggle-explorer-btn" class="explorer-toggle-btn" title="Toggle File Explorer">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M4 3h16a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm1 2v14h14V5H5zm2 2h4v4H7V7zm0 6h4v4H7v-4zm6-6h4v4h-4V7zm0 6h4v4h-4v-4z"/></svg>
+      </button>
       <div class="logo">
         <span class="logo-icon">🖥️</span>
         <span>Terminal AI Control</span>
@@ -41,19 +44,36 @@
     </div>
   </header>
 
-  <!-- Terminal -->
-  <div class="terminal-wrapper">
-    <div class="terminal-header">
-      <div class="terminal-tabs" id="terminal-tabs">
-        <!-- Tabs will be dynamically added here -->
+  <div class="main-container">
+    <!-- File Explorer Panel -->
+    <aside id="file-explorer" class="file-explorer-panel">
+      <div class="file-explorer-header">
+        <span>Project</span>
+        <button id="refresh-explorer-btn" title="Refresh">🔄</button>
       </div>
-      <div class="terminal-controls">
-        <div class="terminal-control control-close" onclick="window.close()"></div>
-        <div class="terminal-control control-minimize"></div>
-        <div class="terminal-control control-maximize" onclick="toggleFullscreen()"></div>
+      <div id="file-explorer-content" class="file-explorer-content">
+        <!-- Tree will be rendered here -->
+        <div class="spinner-container"><div class="spinner"></div></div>
       </div>
+    </aside>
+
+    <!-- Resizer -->
+    <div id="resizer" class="resizer"></div>
+
+    <!-- Terminal -->
+    <div class="terminal-wrapper">
+      <div class="terminal-header">
+        <div class="terminal-tabs" id="terminal-tabs">
+          <!-- Tabs will be dynamically added here -->
+        </div>
+        <div class="terminal-controls">
+          <div class="terminal-control control-close" onclick="window.close()"></div>
+          <div class="terminal-control control-minimize"></div>
+          <div class="terminal-control control-maximize" onclick="toggleFullscreen()"></div>
+        </div>
+      </div>
+      <div id="terminal-container"></div>
     </div>
-    <div id="terminal-container"></div>
   </div>
 
   <!-- Footer -->
@@ -75,13 +95,15 @@
   <div class="toast-container" id="toast-container"></div>
 
   <script>
+    // --- Global State ---
     let socket;
-    let terminals = new Map(); // Map of terminalId -> { terminal, fitAddon }
+    let terminals = new Map();
     let activeTerminalId = null;
     let tabCounter = 0;
-    let sessionId = getCookie('sessionId') || null; // Session ID for persistence
+    let sessionId = getCookie('sessionId') || null;
+    let workingDirectory = null;
 
-    // Cookie helper functions
+    // --- Cookie Helpers ---
     function setCookie(name, value, days = 365) {
       const expires = new Date(Date.now() + days * 864e5).toUTCString();
       document.cookie = name + '=' + encodeURIComponent(value) + '; expires=' + expires + '; path=/';
@@ -94,434 +116,390 @@
       }, '');
     }
 
-    // Create a new terminal instance
-    function createTerminalInstance() {
-      const terminal = new Terminal({
-        cursorBlink: true,
-        cursorStyle: 'bar',
-        fontSize: 15,
-        lineHeight: 1.4,
-        fontFamily: '"JetBrains Mono", "Fira Code", "SF Mono", Menlo, Monaco, "Courier New", monospace',
-        theme: {
-          background: '#252936',
-          foreground: '#f0f2f5',
-          cursor: '#6c8eef',
-          cursorAccent: '#252936',
-          selection: 'rgba(108, 142, 239, 0.4)',
-          black: '#3d4153',
-          red: '#f87171',
-          green: '#4ade80',
-          yellow: '#fbbf24',
-          blue: '#6c8eef',
-          magenta: '#c084fc',
-          cyan: '#22d3ee',
-          white: '#cbd5e1',
-          brightBlack: '#64748b',
-          brightRed: '#fca5a5',
-          brightGreen: '#86efac',
-          brightYellow: '#fcd34d',
-          brightBlue: '#93b4ff',
-          brightMagenta: '#d8b4fe',
-          brightCyan: '#67e8f9',
-          brightWhite: '#f1f5f9'
-        },
-        allowTransparency: false,
-        scrollback: 10000,
-        tabStopWidth: 4
-      });
-
-      const fitAddon = new FitAddon.FitAddon();
-      const webLinksAddon = new WebLinksAddon.WebLinksAddon();
-
-      terminal.loadAddon(fitAddon);
-      terminal.loadAddon(webLinksAddon);
-
-      return { terminal, fitAddon };
+    // --- File Explorer Logic ---
+    function requestFileTree(newPath) {
+      if (newPath) {
+        workingDirectory = newPath;
+      }
+      const content = document.getElementById('file-explorer-content');
+      if (socket?.connected && workingDirectory) {
+        content.innerHTML = '<div class="spinner-container"><div class="spinner"></div></div>';
+        socket.emit('filetree:get', { targetPath: workingDirectory });
+      }
     }
 
-    // Add a new terminal tab
+    function renderFileTree(node, container) {
+      const ul = document.createElement('ul');
+      if (node.path !== workingDirectory) {
+        ul.classList.add('hidden');
+      }
+
+      const children = Array.isArray(node.children) ? node.children : [];
+
+      for (const item of children) {
+        const li = document.createElement('li');
+        li.dataset.path = item.path;
+        const entry = document.createElement('div');
+        entry.className = `file-entry type-${item.type}`;
+        const icon = document.createElement('span');
+        icon.className = 'icon';
+        const name = document.createElement('span');
+        name.className = 'name';
+        name.textContent = item.name;
+        
+        entry.appendChild(icon);
+        entry.appendChild(name);
+        li.appendChild(entry);
+
+        if (item.type === 'directory') {
+          if (item.error === 'permission_denied') {
+            entry.classList.add('unreadable');
+            icon.textContent = '🔒';
+            entry.title = 'Permission denied';
+          } else {
+            icon.textContent = '📁';
+            entry.onclick = (e) => {
+              e.stopPropagation();
+              entry.classList.toggle('open');
+              const childUl = li.querySelector('ul');
+              if (childUl) {
+                childUl.classList.toggle('hidden');
+              }
+            };
+            renderFileTree(item, li);
+          }
+        } else {
+          icon.textContent = '📄';
+          entry.onclick = (e) => {
+            e.stopPropagation();
+            const term = terminals.get(activeTerminalId);
+            if (term) {
+              term.terminal.paste(`'${item.path}'`);
+            }
+          };
+        }
+        ul.appendChild(li);
+      }
+      container.appendChild(ul);
+    }
+    
+    function initializeFileExplorer() {
+        const explorer = document.getElementById('file-explorer');
+        const resizer = document.getElementById('resizer');
+        const toggleBtn = document.getElementById('toggle-explorer-btn');
+        const refreshBtn = document.getElementById('refresh-explorer-btn');
+
+        toggleBtn.onclick = () => {
+          explorer.classList.toggle('collapsed');
+          resizer.classList.toggle('collapsed');
+        };
+
+        refreshBtn.onclick = requestFileTree;
+
+        if (window.innerWidth <= 768) {
+            explorer.classList.add('collapsed');
+            resizer.classList.add('collapsed');
+        }
+
+        let isResizing = false;
+        resizer.addEventListener('mousedown', (e) => {
+            isResizing = true;
+            document.addEventListener('mousemove', handleMouseMove);
+            document.addEventListener('mouseup', () => {
+                isResizing = false;
+                document.removeEventListener('mousemove', handleMouseMove);
+            });
+        });
+
+        function handleMouseMove(e) {
+            if (!isResizing) return;
+            const sidebarWidth = e.clientX;
+            if (sidebarWidth > 200 && sidebarWidth < 600) {
+                explorer.style.width = sidebarWidth + 'px';
+            }
+        }
+    }
+
+
+    // --- Terminal & Session Logic ---
+        function createTerminalInstance() {
+          const terminal = new Terminal({
+            cursorBlink: true,
+            cursorStyle: 'bar',
+            fontSize: 15,
+            lineHeight: 1.4,
+            fontFamily: '"JetBrains Mono", "Fira Code", "SF Mono", Menlo, Monaco, "Courier New", monospace',
+            theme: {
+              background: '#252936',
+              foreground: '#f0f2f5',
+              cursor: '#6c8eef',
+              cursorAccent: '#252936',
+              selection: 'rgba(108, 142, 239, 0.4)',
+              black: '#3d4153',
+              red: '#f87171',
+              green: '#4ade80',
+              yellow: '#fbbf24',
+              blue: '#6c8eef',
+              magenta: '#c084fc',
+              cyan: '#22d3ee',
+              white: '#cbd5e1',
+              brightBlack: '#64748b',
+              brightRed: '#fca5a5',
+              brightGreen: '#86efac',
+              brightYellow: '#fcd34d',
+              brightBlue: '#93b4ff',
+              brightMagenta: '#d8b4fe',
+              brightCyan: '#67e8f9',
+              brightWhite: '#f1f5f9'
+            },
+            allowTransparency: false,
+            scrollback: 10000,
+            tabStopWidth: 4
+          });
+    
+          const fitAddon = new FitAddon.FitAddon();
+          const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+          terminal.loadAddon(fitAddon);
+          terminal.loadAddon(webLinksAddon);
+    
+          // Register OSC handler for CWD detection
+          terminal.parser.registerOscHandler(777, (data) => {
+            const payload = data.substring(data.indexOf(';') + 1);
+            if (payload.startsWith('CWD=')) {
+              const newPath = payload.substring(4).trim();
+              if (newPath && newPath !== workingDirectory) {
+                console.log("CWD changed to:", newPath);
+                requestFileTree(newPath);
+              }
+            }
+            return true;
+          });
+    
+          return { terminal, fitAddon };
+        }
+
     function addTerminalTab() {
       if (!socket?.connected) {
         showToast('서버에 연결되지 않았습니다', 'error');
         return;
       }
-
-      // Request server to create a new terminal
-      socket.emit('terminal:create', {
-        cols: 80,
-        rows: 24
-      });
+      socket.emit('terminal:create', { cols: 80, rows: 24 });
     }
 
-    // Switch to a specific terminal
     function switchTerminal(terminalId) {
       if (activeTerminalId === terminalId) return;
-
-      // Hide current terminal
       if (activeTerminalId) {
         const current = terminals.get(activeTerminalId);
-        if (current?.terminal) {
-          current.terminal.element.style.display = 'none';
-        }
+        if (current?.terminal) current.terminal.element.style.display = 'none';
       }
-
-      // Show selected terminal
       const selected = terminals.get(terminalId);
       if (selected?.terminal) {
         selected.terminal.element.style.display = 'block';
         selected.terminal.focus();
         selected.fitAddon.fit();
         activeTerminalId = terminalId;
-
-        // Update tab UI
         updateTabUI();
       }
     }
 
-    // Close a terminal tab
     function closeTerminalTab(terminalId, event) {
-      if (event) {
-        event.stopPropagation();
-      }
-
+      if (event) event.stopPropagation();
       const termData = terminals.get(terminalId);
       if (!termData) return;
-
-      // Don't close if it's the last terminal
       if (terminals.size === 1) {
         showToast('마지막 터미널은 닫을 수 없습니다', 'error');
         return;
       }
-
-      // Close on server
       socket.emit('terminal:close', { terminalId });
-
-      // Remove from DOM
-      if (termData.terminal?.element) {
-        termData.terminal.dispose();
-      }
-
-      // Remove from map
+      if (termData.terminal?.element) termData.terminal.dispose();
       terminals.delete(terminalId);
-
-      // Remove tab from UI
       const tabElement = document.querySelector(`[data-terminal-id="${terminalId}"]`);
-      if (tabElement) {
-        tabElement.remove();
-      }
-
-      // If this was the active terminal, switch to another
+      if (tabElement) tabElement.remove();
       if (activeTerminalId === terminalId) {
         const firstTerminalId = terminals.keys().next().value;
-        if (firstTerminalId) {
-          switchTerminal(firstTerminalId);
-        }
+        if (firstTerminalId) switchTerminal(firstTerminalId);
       }
     }
 
-    // Update tab UI to reflect active state
     function updateTabUI() {
       document.querySelectorAll('.terminal-tab').forEach(tab => {
         const terminalId = tab.getAttribute('data-terminal-id');
-        if (terminalId === activeTerminalId) {
-          tab.classList.add('active');
-        } else {
-          tab.classList.remove('active');
-        }
+        tab.classList.toggle('active', terminalId === activeTerminalId);
       });
     }
 
-    // Render tabs
     function renderTabs() {
       const tabsContainer = document.getElementById('terminal-tabs');
       tabsContainer.innerHTML = '';
-
       terminals.forEach((termData, terminalId) => {
         const tab = document.createElement('div');
         tab.className = 'terminal-tab';
         tab.setAttribute('data-terminal-id', terminalId);
-        
         const label = document.createElement('span');
         label.className = 'tab-label';
         label.textContent = termData.customName || `터미널 ${termData.tabNumber}`;
-        
-        // Handle renaming on double-click
         tab.ondblclick = () => {
-          // Temporarily disable the single-click handler to prevent switching
-          tab.onclick = null; 
+          tab.onclick = null;
           label.contentEditable = true;
           label.focus();
           document.execCommand('selectAll', false, null);
-
           const saveName = () => {
             label.contentEditable = false;
-            // Re-enable the single-click handler
             tab.onclick = () => switchTerminal(terminalId);
-
             const newName = label.textContent.trim();
-            
-            // Update only if the name has actually changed
             if (newName && newName !== (termData.customName || `터미널 ${termData.tabNumber}`)) {
               termData.customName = newName;
               socket.emit('terminal:rename', { terminalId, customName: newName });
               showToast(`터미널 이름이 "${newName}"(으)로 변경되었습니다.`, 'success');
             } else {
-              // If the name is empty or unchanged, restore the original text
               label.textContent = termData.customName || `터미널 ${termData.tabNumber}`;
             }
           };
-
-          // Save when focus is lost
           label.onblur = saveName;
-          
-          // Save on Enter, cancel on Escape
           label.onkeydown = (e) => {
             if (e.key === 'Enter') {
               e.preventDefault();
               saveName();
             } else if (e.key === 'Escape') {
               label.contentEditable = false;
-              // Restore original name and exit edit mode
               label.textContent = termData.customName || `터미널 ${termData.tabNumber}`;
               tab.onclick = () => switchTerminal(terminalId);
-              label.blur(); // Trigger blur to clean up other listeners
+              label.blur();
             }
           };
         };
-
-        // Set the initial single-click handler
         tab.onclick = () => switchTerminal(terminalId);
-
         tab.appendChild(label);
-
         const closeBtn = document.createElement('span');
         closeBtn.className = 'tab-close';
         closeBtn.innerHTML = '×';
         closeBtn.onclick = (e) => closeTerminalTab(terminalId, e);
         tab.appendChild(closeBtn);
-
         tabsContainer.appendChild(tab);
       });
-
-      // Add new tab button
       const newTabBtn = document.createElement('div');
       newTabBtn.className = 'new-tab-btn';
       newTabBtn.innerHTML = '+';
       newTabBtn.onclick = addTerminalTab;
       tabsContainer.appendChild(newTabBtn);
-
       updateTabUI();
     }
 
-    // Connect to server
     function connect() {
-      socket = io({
-        reconnection: true,
-        reconnectionAttempts: 10,
-        reconnectionDelay: 1000
-      });
+      socket = io({ reconnection: true, reconnectionAttempts: 10, reconnectionDelay: 1000 });
 
       socket.on('connect', () => {
         console.log('Connected to server');
         updateStatus(true);
-
-        // Send initial visibility state
         socket.emit('page:visibility', { hidden: document.hidden });
-
-        // Initialize or restore session
         console.log('Requesting session init with ID:', sessionId || 'none');
         socket.emit('session:init', { sessionId });
       });
 
-      // Session created (new session)
-      socket.on('session:created', ({ sessionId: newSessionId }) => {
+      socket.on('session:created', ({ sessionId: newSessionId, workingDirectory: wd }) => {
         console.log('New session created:', newSessionId);
         sessionId = newSessionId;
         setCookie('sessionId', sessionId);
-
-        // Create first terminal
+        workingDirectory = wd;
+        requestFileTree();
         addTerminalTab();
       });
 
-      // Session restored (reconnected to existing session)
-      socket.on('session:restored', ({ sessionId: restoredSessionId, terminals: terminalList }) => {
-        console.log('Session restored:', restoredSessionId, 'with terminals:', terminalList);
+      socket.on('session:restored', ({ sessionId: restoredSessionId, terminals: terminalList, workingDirectory: wd }) => {
+        console.log('Session restored:', restoredSessionId);
         sessionId = restoredSessionId;
-
-        // Clear existing terminals
-        terminals.forEach(term => {
-          if (term.terminal) {
-            term.terminal.dispose();
-          }
-        });
+        workingDirectory = wd;
+        requestFileTree();
+        terminals.forEach(term => { if (term.terminal) term.terminal.dispose(); });
         terminals.clear();
         tabCounter = 0;
-
-        // Recreate terminal instances for each restored terminal
         terminalList.forEach(termInfo => {
           const { terminalId, pid, tabNumber } = termInfo;
-
-          // Create terminal instance
           const { terminal, fitAddon } = createTerminalInstance();
-
-          // Open terminal in container (hidden initially)
           terminal.open(document.getElementById('terminal-container'));
           terminal.element.style.display = 'none';
           fitAddon.fit();
-
-          // Handle terminal input
           terminal.onData((inputData) => {
-            if (socket?.connected) {
-              socket.emit('terminal:input', {
-                terminalId,
-                data: inputData
-              });
-            }
+            if (socket?.connected) socket.emit('terminal:input', { terminalId, data: inputData });
           });
-
-          // Store terminal
-          terminals.set(terminalId, {
-            terminal,
-            fitAddon,
-            tabNumber: tabNumber,
-            customName: termInfo.customName
-          });
-
-          // Update tab counter
-          if (tabNumber > tabCounter) {
-            tabCounter = tabNumber;
-          }
+          terminals.set(terminalId, { terminal, fitAddon, tabNumber: tabNumber, customName: termInfo.customName });
+          if (tabNumber > tabCounter) tabCounter = tabNumber;
         });
-
-        // Render tabs
         renderTabs();
-
-        // Switch to first terminal
-        if (terminalList.length > 0) {
-          switchTerminal(terminalList[0].terminalId);
-        }
-
-        // Hide loading
+        if (terminalList.length > 0) switchTerminal(terminalList[0].terminalId);
         document.getElementById('loading').classList.add('hidden');
-
-        // Show restored message
         showToast(`세션 복구됨: ${terminalList.length}개 터미널`, 'success');
       });
 
-      // Receive buffered output
       socket.on('terminal:buffered', ({ terminalId, data }) => {
-        console.log(`Received buffered output for ${terminalId}:`, data.length, 'bytes');
         const termData = terminals.get(terminalId);
-        if (termData?.terminal) {
-          termData.terminal.write(data);
-        }
+        if (termData?.terminal) termData.terminal.write(data);
       });
 
-      // Session replaced (logged in from another location)
       socket.on('session:replaced', ({ message }) => {
         showToast(message, 'error');
-        setTimeout(() => {
-          window.location.reload();
-        }, 2000);
+        setTimeout(() => { window.location.reload(); }, 2000);
       });
 
       socket.on('terminal:ready', (data) => {
         console.log('Terminal ready:', data);
         const { terminalId, pid, tabNumber, customName } = data;
-
-        // Create terminal instance
         const { terminal, fitAddon } = createTerminalInstance();
-
-        // Open terminal in container
         terminal.open(document.getElementById('terminal-container'));
         fitAddon.fit();
-
-        // Handle terminal input
         terminal.onData((inputData) => {
-          if (socket?.connected) {
-            socket.emit('terminal:input', {
-              terminalId,
-              data: inputData
-            });
-          }
+          if (socket?.connected) socket.emit('terminal:input', { terminalId, data: inputData });
         });
-
-        // Store terminal (use server's tabNumber)
-        terminals.set(terminalId, {
-          terminal,
-          fitAddon,
-          tabNumber: tabNumber,
-          customName: customName
-        });
-
-        // Update local tab counter
-        if (tabNumber > tabCounter) {
-          tabCounter = tabNumber;
-        }
-
-        // Hide loading on first terminal
-        if (terminals.size === 1) {
-          document.getElementById('loading').classList.add('hidden');
-        }
-
-        // Render tabs and switch to new terminal
+        terminals.set(terminalId, { terminal, fitAddon, tabNumber: tabNumber, customName: customName });
+        if (tabNumber > tabCounter) tabCounter = tabNumber;
+        if (terminals.size === 1) document.getElementById('loading').classList.add('hidden');
         renderTabs();
         switchTerminal(terminalId);
-
         showToast(`터미널 ${tabNumber} 연결됨`, 'success');
       });
 
       socket.on('terminal:data', ({ terminalId, data }) => {
         const termData = terminals.get(terminalId);
-        if (termData?.terminal) {
-          termData.terminal.write(data);
-        }
+        if (termData?.terminal) termData.terminal.write(data);
       });
 
       socket.on('terminal:exit', ({ terminalId, exitCode }) => {
         const termData = terminals.get(terminalId);
-        if (termData?.terminal) {
-          termData.terminal.writeln(`\r\n\x1b[33m[프로세스 종료: ${exitCode}]\x1b[0m`);
-        }
+        if (termData?.terminal) termData.terminal.writeln(`\r\n\x1b[33m[프로세스 종료: ${exitCode}]\x1b[0m`);
         showToast(`터미널 ${termData?.tabNumber} 세션 종료됨`, 'info');
       });
 
-      socket.on('terminal:error', (error) => {
+      socket.on('terminal:error', (error) => { showToast(error, 'error'); });
+      socket.on('disconnect', () => { updateStatus(false); showToast('연결 끊김', 'error'); });
+      socket.on('connect_error', (error) => { console.error('Connection error:', error); updateStatus(false); });
+      
+      socket.on('filetree:data', ({ path, tree }) => {
+        const content = document.getElementById('file-explorer-content');
+        content.innerHTML = '';
+        renderFileTree({ path, children: tree, type: 'directory' }, content);
+      });
+
+      socket.on('filetree:error', (error) => {
+        const content = document.getElementById('file-explorer-content');
+        content.innerHTML = `<div class="error-message">${error}</div>`;
         showToast(error, 'error');
       });
 
-      socket.on('disconnect', () => {
-        updateStatus(false);
-        showToast('연결 끊김', 'error');
-      });
-
-      socket.on('connect_error', (error) => {
-        console.error('Connection error:', error);
-        updateStatus(false);
-      });
-
-      // Handle window resize
       window.addEventListener('resize', () => {
         if (activeTerminalId) {
           const termData = terminals.get(activeTerminalId);
           if (termData && socket?.connected) {
             termData.fitAddon.fit();
-            socket.emit('terminal:resize', {
-              terminalId: activeTerminalId,
-              cols: termData.terminal.cols,
-              rows: termData.terminal.rows
-            });
+            socket.emit('terminal:resize', { terminalId: activeTerminalId, cols: termData.terminal.cols, rows: termData.terminal.rows });
           }
         }
       });
     }
 
-    // Update connection status
     function updateStatus(connected) {
       const dot = document.getElementById('status-dot');
       const text = document.getElementById('status-text');
       const reconnectBtn = document.getElementById('reconnect-btn');
-
       if (connected) {
         dot.classList.add('connected');
         text.textContent = '연결됨';
@@ -533,28 +511,16 @@
       }
     }
 
-    // Reconnect
     function reconnect() {
       document.getElementById('loading').classList.remove('hidden');
-
-      // Clear all terminals
-      terminals.forEach((termData) => {
-        if (termData.terminal) {
-          termData.terminal.dispose();
-        }
-      });
+      terminals.forEach((termData) => { if (termData.terminal) termData.terminal.dispose(); });
       terminals.clear();
       activeTerminalId = null;
       tabCounter = 0;
-
-      if (socket) {
-        socket.disconnect();
-      }
-
+      if (socket) socket.disconnect();
       connect();
     }
 
-    // Toggle fullscreen
     function toggleFullscreen() {
       if (!document.fullscreenElement) {
         document.documentElement.requestFullscreen();
@@ -563,35 +529,25 @@
       }
     }
 
-    // Show toast notification
     function showToast(message, type = 'info') {
       const container = document.getElementById('toast-container');
       const toast = document.createElement('div');
       toast.className = `toast ${type}`;
-      
-      const icons = {
-        success: '✅',
-        error: '❌',
-        info: 'ℹ️'
-      };
-      
+      const icons = { success: '✅', error: '❌', info: 'ℹ️' };
       toast.innerHTML = `${icons[type] || 'ℹ️'} ${message}`;
       container.appendChild(toast);
-
       setTimeout(() => {
         toast.style.animation = 'slideIn 0.3s ease reverse';
         setTimeout(() => toast.remove(), 300);
       }, 3000);
     }
 
-    // Initialize
     document.addEventListener('DOMContentLoaded', () => {
       connect();
+      initializeFileExplorer();
     });
 
-    // Handle visibility change
     document.addEventListener('visibilitychange', () => {
-      // Reconnect if page becomes visible and socket is disconnected
       if (!document.hidden && socket && !socket.connected) {
         reconnect();
       }
